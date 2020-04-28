@@ -17,7 +17,7 @@ import PackageDescription
 
 var targets: [PackageDescription.Target] = [
     .target(name: "NIOExtras", dependencies: ["NIO"]),
-    .target(name: "NIOHTTPCompression", dependencies: ["NIO", "NIOHTTP1", "CNIOExtrasZlib"]),
+    .target(name: "NIOHTTPCompression", dependencies: ["NIO", "NIOHTTP1", "CNIOExtrasZlib", "CompressNIO"]),
     .target(name: "HTTPServerWithQuiescingDemo", dependencies: ["NIOExtras", "NIOHTTP1"]),
     .target(name: "NIOWritePCAPDemo", dependencies: ["NIO", "NIOExtras", "NIOHTTP1"]),
     .target(name: "CNIOExtrasZlib",
@@ -39,6 +39,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.9.0"),
+        .package(url: "https://github.com/adam-fowler/compress-nio.git", from: "0.3.0"),
     ],
     targets: targets
 )

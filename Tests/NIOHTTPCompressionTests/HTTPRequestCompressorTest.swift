@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import XCTest
+import CompressNIO
 import CNIOExtrasZlib
 import NIO
 import NIOHTTP1
@@ -20,7 +21,7 @@ import NIOHTTP1
 
 class HTTPRequestCompressorTest: XCTestCase {
     
-    func compressionChannel(_ compression: NIOCompression.Algorithm = .gzip) throws -> EmbeddedChannel {
+    func compressionChannel(_ compression: CompressionAlgorithm = .gzip) throws -> EmbeddedChannel {
         let channel = EmbeddedChannel()
         //XCTAssertNoThrow(try channel.pipeline.addHandler(HTTPRequestEncoder(), name: "encoder").wait())
         XCTAssertNoThrow(try channel.pipeline.addHandler(NIOHTTPRequestCompressor(encoding: compression), name: "compressor").wait())

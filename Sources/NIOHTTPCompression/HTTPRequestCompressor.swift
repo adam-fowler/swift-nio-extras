@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import CompressNIO
 import CNIOExtrasZlib
 import NIO
 import NIOHTTP1
@@ -45,20 +46,21 @@ public final class NIOHTTPRequestCompressor: ChannelOutboundHandler, RemovableCh
     }
 
     /// encoding algorithm to use
-    var encoding: NIOCompression.Algorithm
+    var encoding: CompressionAlgorithm
     /// handler state
     var state: State
     /// compression handler
-    var compressor: NIOCompression.Compressor
+    var compressor: NIOCompressor
     /// pending write promise
     var pendingWritePromise: EventLoopPromise<Void>!
     
     /// Initialize a NIOHTTPRequestCompressor
     /// - Parameter encoding: Compression algorithm to use
-    public init(encoding: NIOCompression.Algorithm) {
+    public init(encoding: CompressionAlgorithm) {
         self.encoding = encoding
         self.state = .idle
-        self.compressor = NIOCompression.Compressor()
+        self.compressor = encoding.compressor
+        self.compressor.window = ByteBufferAllocator().buffer(capacity: 64*1024)
     }
     
     public func handlerAdded(context: ChannelHandlerContext) {
@@ -67,7 +69,6 @@ public final class NIOHTTPRequestCompressor: ChannelOutboundHandler, RemovableCh
 
     public func handlerRemoved(context: ChannelHandlerContext) {
         pendingWritePromise.fail(NIOCompression.Error.uncompressedWritesPending)
-        compressor.shutdownIfActive()
     }
 
     /// Write to channel
@@ -77,99 +78,114 @@ public final class NIOHTTPRequestCompressor: ChannelOutboundHandler, RemovableCh
     ///   - promise: The eventloop promise that should be notified when the operation completes
     public func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
         pendingWritePromise.futureResult.cascade(to: promise)
-        
-        let httpData = unwrapOutboundIn(data)
-        switch httpData {
-        case .head(let head):
-            switch state {
-            case .idle:
-                state = .head(head)
-            default:
-                preconditionFailure("Unexpected HTTP head")
-            }
-            compressor.initialize(encoding: self.encoding)
-
-        case .body(let buffer):
-            switch state {
-            case .head(var head):
-                // We only have a head, this is the first body part
-                guard case .byteBuffer(let part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
-                // now we have a body lets add the content-encoding header
-                head.headers.replaceOrAdd(name: "Content-Encoding", value: self.encoding.description)
-                state = .body(head, part)
-            case .body(let head, var body):
-                // we have a head and a body, extend the body with this body part
-                guard case .byteBuffer(var part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
-                body.writeBuffer(&part)
-                state = .body(head, body)
-            case .partialBody(var body):
-                // we have a partial body, extend the partial body with this body part
-                guard case .byteBuffer(var part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
-                body.writeBuffer(&part)
-                state = .partialBody(body)
-            default:
-                preconditionFailure("Unexpected Body")
-            }
-            
-        case .end:
-            switch state {
+        do {
+            let httpData = unwrapOutboundIn(data)
+            switch httpData {
             case .head(let head):
-                // only found a head
-                context.write(wrapOutboundOut(.head(head)), promise: nil)
-                context.write(data, promise: pendingWritePromise)
-            case .body(var head, var body):
-                // have head and the whole of the body. Compress body, set content length header and write it all out, including the end
-                let outputBuffer = compressor.compress(inputBuffer: &body, allocator: context.channel.allocator, finalise: true)
-                head.headers.replaceOrAdd(name: "Content-Length", value: outputBuffer.readableBytes.description)
-                context.write(wrapOutboundOut(.head(head)), promise: nil)
-                context.write(wrapOutboundOut(.body(.byteBuffer(outputBuffer))), promise: nil)
-                context.write(data, promise: pendingWritePromise)
-            case .partialBody(var body):
-                // have a section of the body. Compress that section of the body and write it out along with the end
-                let outputBuffer = compressor.compress(inputBuffer: &body, allocator: context.channel.allocator, finalise: true)
-                context.write(wrapOutboundOut(.body(.byteBuffer(outputBuffer))), promise: nil)
-                context.write(data, promise: pendingWritePromise)
-            default:
-                preconditionFailure("Unexpected End")
+                switch state {
+                case .idle:
+                    state = .head(head)
+                default:
+                    preconditionFailure("Unexpected HTTP head")
+                }
+                try compressor.startStream()
+
+            case .body(let buffer):
+                switch state {
+                case .head(var head):
+                    // We only have a head, this is the first body part
+                    guard case .byteBuffer(let part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
+                    // now we have a body lets add the content-encoding header
+                    head.headers.replaceOrAdd(name: "Content-Encoding", value: self.encoding.description)
+                    state = .body(head, part)
+                case .body(let head, var body):
+                    // we have a head and a body, extend the body with this body part
+                    guard case .byteBuffer(var part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
+                    body.writeBuffer(&part)
+                    state = .body(head, body)
+                case .partialBody(var body):
+                    // we have a partial body, extend the partial body with this body part
+                    guard case .byteBuffer(var part) = buffer else { preconditionFailure("Expected a ByteBuffer") }
+                    body.writeBuffer(&part)
+                    state = .partialBody(body)
+                default:
+                    preconditionFailure("Unexpected Body")
+                }
+                
+            case .end:
+                switch state {
+                case .head(let head):
+                    // only found a head
+                    context.write(wrapOutboundOut(.head(head)), promise: nil)
+                    context.write(data, promise: pendingWritePromise)
+                case .body(var head, var body):
+                    // have head and the whole of the body. Compress body, set content length header and write it all out, including the end
+                    let outputBuffer = try body.compressStream(with: compressor, flush: .finish, allocator: context.channel.allocator)
+                    head.headers.replaceOrAdd(name: "Content-Length", value: outputBuffer.readableBytes.description)
+                    context.write(wrapOutboundOut(.head(head)), promise: nil)
+                    context.write(wrapOutboundOut(.body(.byteBuffer(outputBuffer))), promise: nil)
+                    context.write(data, promise: pendingWritePromise)
+                case .partialBody(var body):
+                    // have a section of the body. Compress that section of the body and write it out along with the end
+                    try body.compressStream(with: compressor, flush: .finish) { buffer in
+                        context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+                    }
+                    context.write(data, promise: pendingWritePromise)
+                default:
+                    preconditionFailure("Unexpected End")
+                }
+                state = .end
+                try compressor.finishStream()
             }
-            state = .end
-            compressor.shutdown()
+        } catch {
+            pendingWritePromise.fail(error)
         }
     }
     
     public func flush(context: ChannelHandlerContext) {
-        switch state {
-        case .head(var head):
-            // given we are flushing the head now we have to assume we have a body and set Content-Encoding
-            head.headers.replaceOrAdd(name: "Content-Encoding", value: self.encoding.description)
-            head.headers.remove(name: "Content-Length")
-            head.headers.replaceOrAdd(name: "Transfer-Encoding", value: "chunked")
-            context.write(wrapOutboundOut(.head(head)), promise: pendingWritePromise)
-            state = .partialBody(context.channel.allocator.buffer(capacity: 0))
+        do {
+            switch state {
+            case .head(var head):
+                // given we are flushing the head now we have to assume we have a body and set Content-Encoding
+                head.headers.replaceOrAdd(name: "Content-Encoding", value: self.encoding.description)
+                head.headers.remove(name: "Content-Length")
+                head.headers.replaceOrAdd(name: "Transfer-Encoding", value: "chunked")
+                context.write(wrapOutboundOut(.head(head)), promise: pendingWritePromise)
+                pendingWritePromise = nil
+                state = .partialBody(context.channel.allocator.buffer(capacity: 0))
 
-        case .body(var head, var body):
-            // Write out head with transfer-encoding set to "chunked" as we cannot set the content length
-            // Compress and write out what we have of the the body
-            let outputBuffer = compressor.compress(inputBuffer: &body, allocator: context.channel.allocator, finalise: false)
-            head.headers.remove(name: "Content-Length")
-            head.headers.replaceOrAdd(name: "Transfer-Encoding", value: "chunked")
-            context.write(wrapOutboundOut(.head(head)), promise: nil)
-            context.write(wrapOutboundOut(.body(.byteBuffer(outputBuffer))), promise: pendingWritePromise)
-            state = .partialBody(context.channel.allocator.buffer(capacity: 0))
-            
-        case .partialBody(var body):
-            // Compress and write out what we have of the body
-            let outputBuffer = compressor.compress(inputBuffer: &body, allocator: context.channel.allocator, finalise: false)
-            context.write(wrapOutboundOut(.body(.byteBuffer(outputBuffer))), promise: pendingWritePromise)
-            state = .partialBody(context.channel.allocator.buffer(capacity: 0))
-            
-        default:
+            case .body(var head, var body):
+                // Write out head with transfer-encoding set to "chunked" as we cannot set the content length
+                // Compress and write out what we have of the the body
+                head.headers.remove(name: "Content-Length")
+                head.headers.replaceOrAdd(name: "Transfer-Encoding", value: "chunked")
+                context.write(wrapOutboundOut(.head(head)), promise: nil)
+                try body.compressStream(with: compressor, flush: .no) { buffer in
+                    context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: pendingWritePromise)
+                    pendingWritePromise = nil
+                }
+                state = .partialBody(context.channel.allocator.buffer(capacity: 0))
+                
+            case .partialBody(var body):
+                // Compress and write out what we have of the body
+                try body.compressStream(with: compressor, flush: .no) { buffer in
+                    context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: pendingWritePromise)
+                    pendingWritePromise = nil
+                }
+                state = .partialBody(context.channel.allocator.buffer(capacity: 0))
+                
+            default:
+                context.flush()
+                return
+            }
+            // reset pending write promise
+            if pendingWritePromise == nil {
+                pendingWritePromise = context.eventLoop.makePromise()
+            }
             context.flush()
-            return
+        } catch {
+            pendingWritePromise.fail(error)
         }
-        // reset pending write promise
-        pendingWritePromise = context.eventLoop.makePromise()
-        context.flush()
     }
 }
 

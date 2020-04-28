@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import CNIOExtrasZlib
+import CompressNIO
 import NIOHTTP1
 import NIO
 
